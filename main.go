@@ -40,12 +40,6 @@ const protocolID = "/p2p-chat/1.0.0"
 //   "delete"          - Payload is just the targetId being deleted
 //   "group_announce"  - system message, Payload is the new group's name
 //   "whoami"          - backend -> its own UI only, never sent over libp2p
-//
-// Reactions/edits/deletes are NOT rendered as their own chat bubbles — the
-// frontend treats them as annotations on an existing message, looked up by
-// the targetId embedded in their Payload. This means the backend needs zero
-// special-casing for them: they flow through the exact same persist/
-// broadcast/relay pipeline as everything else.
 type ChatMessage struct {
 	Type      string `json:"type"`
 	Payload   string `json:"payload"`
@@ -55,7 +49,7 @@ type ChatMessage struct {
 	Hops      int    `json:"hops"`
 	Timestamp int64  `json:"timestamp"`
 	Nickname  string `json:"nickname"`
-	FileName  string `json:"fileName,omitempty"` // set for type "file"
+	FileName  string `json:"fileName,omitempty"`
 }
 
 const maxHops = 6 // generous ceiling so a chain like mech -> library -> boys is nowhere close to it
@@ -67,13 +61,15 @@ func newMessageID() string {
 }
 
 // ---------------------------------------------------------------------
-// Multi-hop relay. Range is not the same as mDNS reachability: a node in
-// the mech building and a node in the boys hostel may never directly
-// discover each other, but a node in the library — in range of both —
-// can. Every node floods a NEW message on to every peer it's directly
-// connected to (other than whoever it just came from); the seen-set
-// below is what stops that flood from looping forever once the network
-// has more than a straight line (e.g. any node with 2+ neighbors).
+// Flood relay with admin-gated hopping. A node's OWN locally-typed
+// message still always goes one hop out to whoever it's directly
+// connected to (see the /ws send loop below) — that never changes,
+// otherwise a lone peer couldn't even reach its own admin. What's
+// gated is whether a message that ARRIVED FROM SOMEONE ELSE gets
+// forwarded further: only a designated network admin does that (see
+// isNetworkAdmin below, checked at each call site rather than inside
+// relayToPeers itself, so relayToPeers stays a plain "send this to my
+// current peers" primitive).
 // ---------------------------------------------------------------------
 
 var (
@@ -95,9 +91,7 @@ func markSeen(id string) bool {
 }
 
 // relayToPeers forwards msg to every currently connected peer except
-// `exclude` (the peer we just received it from, if any). Called both for
-// locally-originated messages (exclude = "") and for messages arriving
-// from another peer that still have hops left.
+// `exclude` (the peer we just received it from, if any).
 func relayToPeers(ctx context.Context, host libp2phost.Host, exclude peer.ID, msg ChatMessage) {
 	if msg.Hops >= maxHops {
 		return
@@ -125,12 +119,7 @@ var upgrader = websocket.Upgrader{
 }
 
 // ---------------------------------------------------------------------
-// Persistent storage (bbolt: embedded, pure Go, no cgo — cross-compiles
-// cleanly to ARM later for a Raspberry Pi). One bucket per group holding
-// ordered chat history, plus one index bucket tracking which groups this
-// node has ever seen, so a freshly connected/refreshed tab can be caught
-// up on both "what groups exist" and "what was said in them" instead of
-// starting from nothing every time.
+// Persistent storage (bbolt).
 // ---------------------------------------------------------------------
 
 var db *bolt.DB
@@ -161,14 +150,9 @@ func saveMessage(msg ChatMessage) error {
 		if err := groups.Put([]byte(msg.GroupID), []byte("1")); err != nil {
 			return err
 		}
-
-		// group_announce is not itself chat history, just an index update.
-		// typing is ephemeral by design and must never be replayed on
-		// reconnect, so it's excluded from persistence the same way.
 		if msg.Type == "group_announce" || msg.Type == "typing" {
 			return nil
 		}
-
 		bucket, err := tx.CreateBucketIfNotExists([]byte(msg.GroupID))
 		if err != nil {
 			return err
@@ -221,14 +205,7 @@ func historyFor(groupID string) []ChatMessage {
 }
 
 // ---------------------------------------------------------------------
-// Broadcast hub. Multiple browser tabs (and later, multiple paired
-// mobile clients) can be attached to this one backend at once. The old
-// code used a single shared `chan ChatMessage` with one consumer
-// goroutine per connection — since a Go channel hands each item to
-// exactly ONE receiver, two attached tabs would just split messages
-// between them instead of both seeing everything. This hub instead
-// keeps an explicit set of live connections and writes every message to
-// every one of them.
+// Broadcast hub.
 // ---------------------------------------------------------------------
 
 type hub struct {
@@ -264,13 +241,7 @@ func (h *hub) broadcast(msg ChatMessage) {
 }
 
 // ---------------------------------------------------------------------
-// Network health tracking. This is deliberately lightweight and purely
-// in-memory (not persisted) — it's a live snapshot of "how alive does
-// the mesh look from this node's point of view" for the /health
-// endpoint, not a historical record. connectedPeers is read fresh from
-// libp2p each time (it's already authoritative there), but messagesSeen
-// / maxHopsSeen / lastActivity need to be tracked as messages pass
-// through, since libp2p itself doesn't remember that for us.
+// Network health tracking.
 // ---------------------------------------------------------------------
 
 type healthStats struct {
@@ -296,6 +267,15 @@ func (s *healthStats) snapshot() (messagesSeen int, maxHops int, lastActivity ti
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.messagesSeen, s.maxHopsSeen, s.lastActivity
+}
+
+// isNetworkAdmin reuses the existing admin-logging toggle: whichever
+// device answered "yes" to the admin prompt (or hit /admin/enable) is
+// now ALSO this network's sync authority and hop backbone, not just its
+// audit log. One designation, two responsibilities — matches "each
+// network will have one admin, which will help in hopping."
+func isNetworkAdmin() bool {
+	return isAdminLoggingEnabled()
 }
 
 func main() {
@@ -343,9 +323,6 @@ func main() {
 			return
 		}
 
-		// Drop anything we've already relayed once — without this, a
-		// network with any loop in it (e.g. three buildings that are all
-		// pairwise in range) would flood the same message forever.
 		if msg.MessageID == "" || markSeen(msg.MessageID) {
 			return
 		}
@@ -357,17 +334,60 @@ func main() {
 		}
 		h.broadcast(msg)
 
-		// Multi-hop relay: pass it on to every OTHER peer we're directly
-		// connected to (not back to whoever just sent it to us). This is
-		// what lets a message cross from a building that can't reach the
-		// final destination directly, via one that can reach both.
-		relayToPeers(ctx, host, remote, msg)
+		// Hopping is admin-gated: a message that just ARRIVED from
+		// someone else only continues being forwarded further if THIS
+		// node is the network admin. Regular peers still receive and
+		// display it (above), they just don't amplify it onward — only
+		// admins bridge between networks now.
+		if isNetworkAdmin() {
+			relayToPeers(ctx, host, remote, msg)
+		}
 
 		// Log every message this node ever sees, if admin logging is on.
 		if store := currentAdminStore(); store != nil {
 			store.record(msg)
 		}
 	})
+
+	// ---- Admin-mediated sync (see sync.go) ----
+	// applyBackfill is how a message that arrives via the catch-up
+	// exchange gets wired into the exact same pipeline a live message
+	// goes through: persisted, pushed to attached UI tabs, and (if this
+	// node is admin) relayed onward to this node's OTHER peers. It also
+	// announces the group to attached tabs if this backfill just taught
+	// this node about a group it didn't know existed before.
+	applyBackfill := func(msg ChatMessage) {
+		if msg.MessageID == "" || markSeen(msg.MessageID) {
+			return // already have it
+		}
+		wasNewGroup := !groupKnownLocally(msg.GroupID)
+
+		stats.record(msg.Hops)
+
+		if err := saveMessage(msg); err != nil {
+			log.Println("failed to persist backfilled message:", err)
+		}
+		h.broadcast(msg)
+		if wasNewGroup && msg.GroupID != "general" {
+			h.broadcast(ChatMessage{Type: "group_announce", Payload: msg.GroupID, GroupID: msg.GroupID})
+		}
+		if isNetworkAdmin() {
+			relayToPeers(ctx, host, "", msg)
+		}
+
+		if store := currentAdminStore(); store != nil {
+			store.record(msg)
+		}
+	}
+
+	// syncServer is the passive side and runs on every node — an admin
+	// needs somewhere to pull from / push to even though the peer
+	// itself never initiates (see syncNotifee.Connected in sync.go,
+	// which gates INITIATION on isNetworkAdmin, not response).
+	host.SetStreamHandler(syncProtocolID, func(s network.Stream) {
+		syncServer(s, applyBackfill)
+	})
+	host.Network().Notify(newSyncNotifee(ctx, host, applyBackfill, isNetworkAdmin))
 
 	if err := setupMDNS(ctx, host); err != nil {
 		log.Fatal(err)
@@ -379,12 +399,8 @@ func main() {
 	mux.Handle("/", http.FileServer(http.Dir("./static")))
 
 	// Peer/mesh topology: this node's own view of who it's directly
-	// connected to right now. Note this is inherently local — each node
-	// only knows its own direct connections, not the full mesh graph, so
-	// the frontend's topology view is "what does this one node see",
-	// not a global map. Combined with a message's Hops field (see
-	// /health and the reaction/edit annotations), it's still enough to
-	// tell direct-connection traffic apart from genuinely relayed traffic.
+	// connected to right now. Inherently local — each node only knows
+	// its own direct connections, not the full mesh graph.
 	mux.HandleFunc("/peers", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		peers := host.Network().Peers()
@@ -398,9 +414,9 @@ func main() {
 		})
 	})
 
-	// Network health: a rough, best-effort signal of mesh liveness from
-	// this node's vantage point. secondsSinceLastActivity is -1 until
-	// this node has seen its first message.
+	// Network health: rough, best-effort mesh liveness from this node's
+	// vantage point, plus whether this node is currently acting as its
+	// network's admin (sync authority + hop backbone).
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		messagesSeen, maxHops, lastActivity := stats.snapshot()
@@ -413,6 +429,7 @@ func main() {
 			"messagesSeen":             messagesSeen,
 			"maxHopsObserved":          maxHops,
 			"secondsSinceLastActivity": lastActivitySecs,
+			"isAdmin":                  isNetworkAdmin(),
 		})
 	})
 
@@ -427,18 +444,11 @@ func main() {
 		h.add(conn)
 		defer h.remove(conn)
 
-		// Tell this tab its own peer ID, so it can tell its own messages
-		// apart from others' once they come back through the broadcast.
 		conn.WriteJSON(ChatMessage{Type: "whoami", Payload: host.ID().String()})
 
-		// Catch this tab up: announce every known group, then replay each
-		// group's stored history, in order. Reactions/edits/deletes are
-		// interleaved in with regular messages here since they're stored
-		// the same way — the frontend applies them as annotations during
-		// replay in the same order they originally happened.
 		for _, g := range knownGroups() {
 			if g == "general" {
-				continue // already present in the UI by default
+				continue
 			}
 			conn.WriteJSON(ChatMessage{Type: "group_announce", Payload: g, GroupID: g})
 		}
@@ -448,7 +458,6 @@ func main() {
 			}
 		}
 
-		// Loop to read messages FROM this UI and fan them out everywhere
 		for {
 			var msg ChatMessage
 			if err := conn.ReadJSON(&msg); err != nil {
@@ -462,7 +471,7 @@ func main() {
 			msg.MessageID = newMessageID()
 			msg.Hops = 0
 			msg.Timestamp = time.Now().UnixMilli()
-			markSeen(msg.MessageID) // so we don't re-relay it if it ever loops back to us
+			markSeen(msg.MessageID)
 
 			stats.record(msg.Hops)
 
@@ -470,20 +479,15 @@ func main() {
 				log.Println("failed to persist outgoing message:", err)
 			}
 
-			// Every locally attached client (other tabs, future mobile
-			// clients) sees it immediately, including the sender's own
-			// tab — the frontend distinguishes "own" messages by peer ID,
-			// not by an optimistic local echo, so multiple tabs stay in
-			// sync with each other and with history replay.
 			h.broadcast(msg)
 
-			// Send to every directly connected peer; each of THEM will, in
-			// turn, relay it on to their own peers (see the stream handler
-			// above) — this is what makes it multi-hop rather than
-			// single-hop full-mesh.
+			// A node's OWN message always goes one hop out to whoever
+			// it's directly connected to, regardless of admin status —
+			// only forwarding a message that ARRIVED FROM someone else
+			// (in the stream handler above, and in applyBackfill) is
+			// admin-gated.
 			relayToPeers(ctx, host, "", msg)
 
-			// Log locally-originated messages too, if admin logging is on.
 			if store := currentAdminStore(); store != nil {
 				store.record(msg)
 			}

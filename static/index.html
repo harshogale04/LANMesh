@@ -707,7 +707,12 @@
   function askAdminStatus(){
     if (localStorage.getItem('lanmesh_admin_asked')) return;
     localStorage.setItem('lanmesh_admin_asked', '1');
-    const isAdmin = confirm("Are you the admin for this device?");
+    const isAdmin = confirm(
+  "Are you the designated admin for this network?\n\n" +
+  "Admins are responsible for syncing message history with peers and " +
+  "relaying messages between separate networks (e.g. bridging two " +
+  "buildings). Only enable this on ONE device per physical network."
+);
     if (!isAdmin) return;
     fetch('/admin/enable', { method: 'POST' })
       .then(res => { if (!res.ok) console.error('Failed to enable admin logging:', res.status); })
@@ -1019,16 +1024,18 @@
   }
 
   function renderChat(){
-    chat.innerHTML = "";
-    const visible = allMessages.filter(m => m.groupId === currentGroup);
-    if (visible.length === 0) {
-      chat.appendChild(emptyState);
-      emptyState.style.display = "block";
-    } else {
-      visible.forEach(m => renderSingleMessage(m));
-    }
-    chat.scrollTop = chat.scrollHeight;
+  chat.innerHTML = "";
+  const visible = allMessages
+    .filter(m => m.groupId === currentGroup)
+    .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  if (visible.length === 0) {
+    chat.appendChild(emptyState);
+    emptyState.style.display = "block";
+  } else {
+    visible.forEach(m => renderSingleMessage(m));
   }
+  chat.scrollTop = chat.scrollHeight;
+}
 
   function renderReactionChips(row, messageId){
     const reactions = reactionsById[messageId];

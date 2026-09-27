@@ -13,11 +13,6 @@ import (
 	"time"
 )
 
-// adminStore is a local, append-only log of every message this node has
-// seen (its own + everything relayed through it). Thanks to flood-relay,
-// a node placed centrally in the mesh will naturally see most/all traffic
-// without needing any special network privileges — "admin" just means
-// "this device is writing what it sees to disk".
 type adminStore struct {
 	mu       sync.Mutex
 	file     *os.File
@@ -31,7 +26,6 @@ func newAdminStore(path string) (*adminStore, error) {
 	}
 	store := &adminStore{file: f}
 
-	// Reload prior sessions so the dashboard survives restarts.
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024)
 	for scanner.Scan() {
@@ -68,16 +62,10 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
-// ---- Runtime-toggleable admin state ----
-//
-// This replaces "admin mode decided by a CLI flag at startup" with
-// "admin mode decided by the person answering a prompt in the UI". The
-// frontend calls POST /admin/enable the first time someone answers "yes"
-// to "are you the admin for this device?" — no restart needed.
 var (
 	adminMu   sync.RWMutex
 	adminStor *adminStore
-	adminDir  string // set once in main() from the -data-dir flag
+	adminDir  string
 )
 
 func setAdminDataDir(dir string) {
@@ -90,8 +78,6 @@ func currentAdminStore() *adminStore {
 	return adminStor
 }
 
-// enableAdminLogging lazily opens the local log file the first time it's
-// called. Safe to call more than once — later calls are no-ops.
 func enableAdminLogging() (*adminStore, error) {
 	adminMu.Lock()
 	defer adminMu.Unlock()
@@ -112,9 +98,6 @@ func isAdminLoggingEnabled() bool {
 	return currentAdminStore() != nil
 }
 
-// registerAdminRoutes is always mounted, regardless of whether logging is
-// currently on — /admin and /admin/export.json just report "not enabled"
-// until someone turns it on via /admin/enable (or the -admin flag).
 func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/enable", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
